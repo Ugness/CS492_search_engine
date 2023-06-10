@@ -1,0 +1,5 @@
+**/*.pt
+debug.ipynb
+*.pyc
+**/events*
+*.pkl
