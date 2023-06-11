@@ -139,7 +139,7 @@ class GPT(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, idx, embeddings=None, targets=None, masks=None):
+    def forward(self, idx, embeddings=None, targets=None, masks=None, reduce=True):
         # forward the GPT model
         token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
 
@@ -159,7 +159,7 @@ class GPT(nn.Module):
         if targets is not None:
             _logits = logits[masks]
             _targets = targets[masks]
-            loss = F.cross_entropy(_logits, _targets)
+            loss = F.cross_entropy(_logits, _targets, reduction='mean' if reduce else 'none')
         return logits, loss
 
     # Copilot generated code
@@ -273,6 +273,24 @@ class GPT(nn.Module):
             if (x==self.tokenizer.eos_token_id).all():
                 break
         return answers
+    
+    def predict(self, sample, indices, current_nodes, trie, temperature=1., top_k=None, top_p=None):
+        # x: input text
+        # indices: denotes the current position in the text
+        # trie: prefix tree
+        logits = self(sample)[0]
+        logits = torch.gather(logits, dim=1, index=indices.view(-1, 1, 1).expand(-1, -1, logits.shape[-1]))
+        logits = logits / temperature
+        logits = valid_tokens_masking(logits, trie, current_nodes, eos_id=self.tokenizer.eos_token_id)
+        if top_k is not None:
+            logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+        probs = F.softmax(logits, dim=-1)
+        action = torch.multinomial(probs[:, -1, :], num_samples=1).squeeze(-1)
+
+        log_prob = torch.log_softmax(logits, dim=-1)
+        log_prob = torch.gather(log_prob, dim=-1, index=action.view(-1, 1, 1)).squeeze()
+
+        return logits, probs, log_prob, action
 
 def valid_tokens_masking(logits, trie, current_nodes, eos_id):
     batch_size = logits.shape[0]
@@ -283,8 +301,11 @@ def valid_tokens_masking(logits, trie, current_nodes, eos_id):
         if len(valid_tokens) == 0:
             valid_tokens = [eos_id]
         mask[i, valid_tokens] = True
-    mask = mask.unsqueeze(1).expand(-1, -1, max_num_tokens)
-    return logits.masked_fill(~mask, -float('inf'))
+    mask = mask.unsqueeze(1).expand(-1, -1, max_num_tokens).bool()
+    # simple trick to avoid inplace
+    mask = torch.zeros_like(logits).masked_fill(~mask, -float('inf'))
+    logits = logits + mask
+    return logits
 
 def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
     """Filter a distribution of logits using top-k and/or nucleus (top-p) filtering

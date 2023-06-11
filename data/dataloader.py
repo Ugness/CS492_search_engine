@@ -19,7 +19,7 @@ class SearchData(Dataset):
     '''
     Dataset for search (retrieval) engine.
     returns:
-        - query: [full_expression, <pad>, x]
+        - query: [full_expression, <pad>, x, <eos>]
         - gt_y: tokenized y.
     '''
     def __init__(self, dataset, tokenizer, max_len=100):
@@ -34,10 +34,10 @@ class SearchData(Dataset):
         data = np.ones(self.max_len, dtype=np.int64) * self.tokenizer.pad_token_id
         query = np.append(full_tok, self.tokenizer.pad_token_id)
         query = np.append(query, x_tok)
-        gt_expression = abv_tok
+        query = np.append(query, self.tokenizer.eos_token_id)
         gt_y = ys_tok[x]
         data[:len(query)] = query
-        return data, len(full_tok)-1, gt_y
+        return data, len(query), gt_y
     
     def __len__(self) -> int:
         return len(self.dataset)
