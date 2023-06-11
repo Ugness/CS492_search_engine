@@ -20,7 +20,7 @@ class Env(nn.Module):
         self.a_idx = 0
         self.orig_length = indices.clone()
         self.gt_y = gt_y
-        return data, indices-1, current_nodes # indices point to </s>
+        return data.clone(), indices.clone()-1, current_nodes # indices point to </s>
     
     def compute_reward(self, obs, already_done, reward_type='acc'):
         # TODO:

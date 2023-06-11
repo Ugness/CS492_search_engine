@@ -127,6 +127,10 @@ class GPT(nn.Module):
         self.config = config
         self.tokenizer = tokenizer
 
+    @property
+    def device(self):
+        return self.head.weight.device
+
     def get_block_size(self):
         return self.block_size
 
@@ -274,7 +278,7 @@ class GPT(nn.Module):
                 break
         return answers
     
-    def predict(self, sample, indices, current_nodes, trie, temperature=1., top_k=None, top_p=None):
+    def predict(self, sample, indices, current_nodes, trie, temperature=1., top_k=None, top_p=None, argmax=False):
         # x: input text
         # indices: denotes the current position in the text
         # trie: prefix tree
@@ -285,12 +289,24 @@ class GPT(nn.Module):
         if top_k is not None:
             logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
         probs = F.softmax(logits, dim=-1)
-        action = torch.multinomial(probs[:, -1, :], num_samples=1).squeeze(-1)
+        if not argmax:
+            action = torch.multinomial(probs[:, -1, :], num_samples=1).squeeze(-1)
+        else:
+            action = torch.argmax(probs[:, -1, :], dim=-1)
 
         log_prob = torch.log_softmax(logits, dim=-1)
         log_prob = torch.gather(log_prob, dim=-1, index=action.view(-1, 1, 1)).squeeze()
 
         return logits, probs, log_prob, action
+
+    @torch.no_grad() 
+    def random_act(self, current_nodes, trie):
+        batch_size = len(current_nodes)
+        logits = torch.zeros((batch_size, 1, len(self.tokenizer)), dtype=torch.float32, device=self.device)
+        logits = valid_tokens_masking(logits, trie, current_nodes, eos_id=self.tokenizer.eos_token_id)
+        probs = F.softmax(logits, dim=-1)
+        actions = torch.multinomial(probs[:, -1, :], num_samples=1).squeeze(-1)
+        return actions
 
 def valid_tokens_masking(logits, trie, current_nodes, eos_id):
     batch_size = logits.shape[0]
