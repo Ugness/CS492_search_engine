@@ -22,19 +22,22 @@ class SearchData(Dataset):
         - query: [full_expression, <pad>, x]
         - gt_y: tokenized y.
     '''
-    def __init__(self, dataset, tokenizer):
+    def __init__(self, dataset, tokenizer, max_len=100):
         super().__init__()
         with open(dataset, 'rb') as f:
             self.dataset = pickle.load(f)
         self.tokenizer = tokenizer
+        self.max_len = max_len
     
     def __getitem__(self, index):
         full, abv, ys, x, y, full_tok, abv_tok, ys_tok, x_tok = self.dataset[index]
+        data = np.ones(self.max_len, dtype=np.int64) * self.tokenizer.pad_token_id
         query = np.append(full_tok, self.tokenizer.pad_token_id)
         query = np.append(query, x_tok)
         gt_expression = abv_tok
         gt_y = ys_tok[x]
-        return query, gt_y
+        data[:len(query)] = query
+        return data, len(full_tok)-1, gt_y
     
     def __len__(self) -> int:
         return len(self.dataset)

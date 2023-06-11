@@ -170,54 +170,86 @@ class GPT(nn.Module):
         log_prob = torch.sum(log_probs * torch.nn.functional.one_hot(input_ids[:, 1:], num_classes=log_probs.shape[-1]), dim=-1)
         return log_prob
 
-    def forward_with_past(self, idx, embeddings=None, targets=None, past=None, past_length=None, cbox=None):
-        token_embeddings = self.tok_emb(idx)    # each index maps to a (learnable) vector
-        if embeddings is not None:              # prepend explicit embeddings
-            token_embeddings = torch.cat((embeddings, token_embeddings), dim=1)
+    # def forward_with_past(self, idx, embeddings=None, targets=None, past=None, past_length=None):
+    #     # TODO: use scatter.
+    #     token_embeddings = self.tok_emb(idx)    # each index maps to a (learnable) vector
+    #     if embeddings is not None:              # prepend explicit embeddings
+    #         token_embeddings = torch.cat((embeddings, token_embeddings), dim=1)
 
-        if past is not None:
-            assert past_length is not None
-            past = torch.cat(past, dim=-2)   # n_layer, 2, b, nh, len_past, dim_head
-            past_shape = list(past.shape)
-            expected_shape = [self.config.n_layer, 2, idx.shape[0], self.config.n_head, past_length, self.config.n_embd//self.config.n_head]
-            assert past_shape == expected_shape, f"{past_shape} =/= {expected_shape}"
-            position_embeddings = self.pos_emb[:, past_length, :]  # each position maps to a (learnable) vector
-        else:
-            position_embeddings = self.pos_emb[:, :token_embeddings.shape[1], :]
+    #     if past is not None:
+    #         assert past_length is not None
+    #         past = torch.cat(past, dim=-2)   # n_layer, 2, b, nh, len_past, dim_head
+    #         past_shape = list(past.shape)
+    #         expected_shape = [self.config.n_layer, 2, idx.shape[0], self.config.n_head, past_length, self.config.n_embd//self.config.n_head]
+    #         assert past_shape == expected_shape, f"{past_shape} =/= {expected_shape}"
+    #         position_embeddings = self.pos_emb[:, past_length, :]  # each position maps to a (learnable) vector
+    #     else:
+    #         position_embeddings = self.pos_emb[:, :token_embeddings.shape[1], :]
 
-        x = self.drop(token_embeddings + position_embeddings)
-        presents = []  # accumulate over layers
-        for i, block in enumerate(self.blocks):
-            x, present = block(x, layer_past=past[i, ...] if past is not None else None, return_present=True)
-            presents.append(present)
+    #     x = self.drop(token_embeddings + position_embeddings)
+    #     presents = []  # accumulate over layers
+    #     for i, block in enumerate(self.blocks):
+    #         x, present = block(x, layer_past=past[i, ...] if past is not None else None, return_present=True)
+    #         presents.append(present)
 
-        x = self.ln_f(x)
-        logits = self.head(x)
-        # if we are given some desired targets also calculate the loss
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+    #     x = self.ln_f(x)
+    #     logits = self.head(x)
+    #     # if we are given some desired targets also calculate the loss
+    #     loss = None
+    #     if targets is not None:
+    #         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        return logits, loss, torch.stack(presents)  # _, _, n_layer, 2, b, nh, 1, dim_head
+    #     return logits, loss, torch.stack(presents)  # _, _, n_layer, 2, b, nh, 1, dim_head
 
-    def sample_with_past(self, x, steps, trie, temperature=1., sample_logits=True,
-                        top_k=None, top_p=None, callback=None):
-        sample = x
-        batch_size = x.shape[0]
-        cond_len = x.shape[1]
-        past = None
-        current_nodes = [trie.root for _ in range(batch_size)]
-        for n in range(steps):
-            if callback is not None:
-                callback(n)
-            logits, _, present = self.forward_with_past(x, past=past, past_length=(n+cond_len-1))
-            if past is None:
-                past = [present]
-            else:
-                past.append(present)
+    # def sample_with_past(self, x, steps, trie, temperature=1., sample_logits=True,
+    #                     top_k=None, top_p=None, callback=None):
+    #     sample = x
+    #     batch_size = x.shape[0]
+    #     cond_len = x.shape[1]
+    #     past = None
+    #     current_nodes = [trie.root for _ in range(batch_size)]
+    #     for n in range(steps):
+    #         if callback is not None:
+    #             callback(n)
+    #         logits, _, present = self.forward_with_past(x, past=past, past_length=(n+cond_len-1))
+    #         if past is None:
+    #             past = [present]
+    #         else:
+    #             past.append(present)
             
-            # TODO: shape check
-            logits = logits[:, -1, :] / temperature
+    #         # TODO: shape check
+    #         logits = logits[:, -1, :] / temperature
+    #         logits = valid_tokens_masking(logits, trie, current_nodes, eos_id=self.tokenizer.eos_token_id)
+    #         if top_k is not None:
+    #             logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+    #         probs = F.softmax(logits, dim=-1)
+    #         if not sample_logits:
+    #             _, x = torch.topk(probs, k=1, dim=-1)
+    #         else:
+    #             x = torch.multinomial(probs[:, -1, :], num_samples=1)
+    #         # append to the sequence and continue
+    #         current_nodes = [current_nodes[b].children[x[b].item()] for b in range(batch_size)]
+    #         sample = torch.cat((sample, x), dim=1)
+    #     del past
+    #     sample = sample[:, cond_len:]  # cut conditioning off
+    #     return sample
+
+    def sample(self, query, indices, trie, temperature=1., sample_logits=True, top_k=None, top_p=None):
+        # x: input text
+        # indices: denotes the current position in the text
+        # trie: prefix tree
+        sample = query
+        batch_size = query.shape[0]
+        max_num_tokens = query.shape[1]
+        current_nodes = [trie.root for _ in range(batch_size)]
+        answers = torch.zeros_like(query)
+        a_idx = 0
+        # TODO: decode until all batch reach EOS.
+        while True:
+            logits = self(sample)[0]
+            # TODO: use gather.
+            logits = torch.gather(logits, dim=1, index=indices.view(-1, 1, 1).expand(-1, -1, logits.shape[-1]))
+            logits = logits / temperature
             logits = valid_tokens_masking(logits, trie, current_nodes, eos_id=self.tokenizer.eos_token_id)
             if top_k is not None:
                 logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
@@ -228,15 +260,24 @@ class GPT(nn.Module):
                 x = torch.multinomial(probs[:, -1, :], num_samples=1)
             # append to the sequence and continue
             current_nodes = [current_nodes[b].children[x[b].item()] for b in range(batch_size)]
-            sample = torch.cat((sample, x), dim=1)
-        del past
-        sample = sample[:, cond_len:]  # cut conditioning off
-        return sample
+
+            # update x and indices
+            sample.scatter_(dim=1, index=indices.view(-1, 1), src=x)
+            answers[:, a_idx] = x[:, 0]
+            indices = indices + 1
+            indices = indices.clamp(min=0, max=max_num_tokens-1)
+
+            a_idx += 1
+            if indices.min() == (max_num_tokens-1):
+                break
+            if (x==self.tokenizer.eos_token_id).all():
+                break
+        return answers
 
 def valid_tokens_masking(logits, trie, current_nodes, eos_id):
     batch_size = logits.shape[0]
-    max_num_tokens = logits.shape[1]
-    mask = torch.zeros((batch_size, max_num_tokens), dtype=torch.bool)
+    max_num_tokens = logits.shape[-1]
+    mask = torch.zeros((batch_size, max_num_tokens), dtype=torch.bool, device=logits.device)
     for i in range(batch_size):
         valid_tokens = trie.get_valid_tokens(current_nodes[i])
         if len(valid_tokens) == 0:
