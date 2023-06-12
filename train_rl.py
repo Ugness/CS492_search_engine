@@ -7,6 +7,7 @@ import pickle
 
 from tqdm import tqdm
 import random
+import numpy as np
 
 from copy import deepcopy
 
@@ -24,7 +25,7 @@ def train_policy_gradient_iterative(
         train_loader,
         env,
         gamma=0.99,
-        temperature=1.0,
+        temperature=0.1,
         top_k=None,
         top_p=None,
         writer=None,
@@ -42,9 +43,12 @@ def train_policy_gradient_iterative(
         log_probs = []
         rewards = []
         terminates = []
+        entropys = []
         while not done.all():
             action_logits, action_probs, log_prob, action = act_model.predict(obs, indices, current_nodes, env.trie,
-                                                                              temperature, top_k, top_p)
+                                                                              1.0, top_k, top_p)
+            entropy = -(action_probs * torch.log(action_probs+1e-6))[action_probs>0].sum()
+            entropys.append(entropy / len(obs))
             terminates.append(done)
             obs = obs.detach().clone()
             indices = indices.detach().clone()
@@ -64,8 +68,9 @@ def train_policy_gradient_iterative(
         advantages = returns - returns.mean(-1, keepdim=True)
         # sum over timesteps, mean over episodes
         policy_loss = -(log_probs * advantages.detach() * (1.-terminates)).mean(0).sum(0)
+        entropy_loss = -torch.stack(entropys, -1).mean(0).sum(0) # let the model to maximize the entropy (exploration)
         act_opt.zero_grad()
-        loss = policy_loss
+        loss = policy_loss + temperature * entropy_loss
         loss.backward()
         act_opt.step()
 
@@ -78,10 +83,11 @@ def train_policy_gradient_iterative(
         env_opt.step()
 
         if writer is not None:
-            writer.add_scalar('Loss/policy_loss', policy_loss.item(), i)
-            writer.add_scalar('Loss/ce_loss', ce_loss.item(), i)
-            writer.add_scalar('Reward/episode_reward', episode_reward.mean().item(), i)
-            writer.add_scalar('Accuracy/episode_accuracy', acc.item(), i)
+            writer.add_scalar('Loss/policy_loss', policy_loss.item(), i + n_epoch * len(train_loader))
+            writer.add_scalar('Loss/entropy_loss', entropy_loss.item(), i + n_epoch * len(train_loader))
+            writer.add_scalar('Loss/ce_loss', ce_loss.item(), i + n_epoch * len(train_loader))
+            writer.add_scalar('Reward/episode_reward', episode_reward.mean().item(), i + n_epoch * len(train_loader))
+            writer.add_scalar('Accuracy/episode_accuracy', acc.item(), i + n_epoch * len(train_loader))
         pbar.set_description(f"Episode {i+1}: reward={episode_reward.mean().item():.4f}, policy_loss={policy_loss.item():.4f}, accuracy={acc.item():.4f}")
         pbar.update()
 
@@ -159,6 +165,8 @@ def train_q_learning_iterative(
     
     pbar = tqdm(train_loader)
     target_model = deepcopy(model)
+    actor.train()
+    env.train()
     for i, (data, length, gt_y) in enumerate(train_loader):
         data, length, gt_y = data.cuda(), length.cuda(), gt_y.cuda()
         obs, indices, current_nodes = env.reset(data, length, gt_y)
@@ -238,6 +246,8 @@ def train_supervised_iterative(
         n_epoch=0,):
     pbar = tqdm(train_loader)
     # loader: []
+    actor.train()
+    env.train()
     for i, (data, target, mask, length, gt_y) in enumerate(train_loader):
         data, mask, target, length, gt_y = data.cuda(), mask.cuda(), target.cuda(), length.cuda(), gt_y.cuda()
         logits, loss = act_model(data, masks=mask, targets=target)
@@ -271,8 +281,35 @@ def train_supervised_iterative(
         pbar.set_description(f"Epoch {n_epoch}, Episode {i+1}: loss={loss.item():.4f}, accuracy={acc.item():.4f}")
         pbar.update()
 
-def evaluate(*args, **kwargs):
-    pass
+def evaluate(actor, env, loader, reward_type='acc', num_epoch=0, writer=None):
+    actor.eval()
+    env.eval()
+    corrects = 0
+    total = 0
+    with torch.no_grad():
+        for i, (data, length, gt_y) in enumerate(loader):
+            data, length, gt_y = data.cuda(), length.cuda(), gt_y.cuda()
+            obs, indices, current_nodes = env.reset(data, length, gt_y)
+            B = len(obs)
+            done = torch.zeros(len(data), dtype=torch.bool, device=obs.device, requires_grad=False)
+            while not done.all():
+                action_logits, action_probs, log_prob, action = actor.predict(obs, indices, current_nodes, env.trie, argmax=True)
+                obs = obs.detach().clone()
+                indices = indices.detach().clone()
+                obs, indices, current_nodes, reward, done, correct = env.step(obs, indices, current_nodes, action, done, reward_type)
+            # update reader
+            obs, indices, current_nodes, reward, done, correct = env.step(obs, indices, current_nodes, action, torch.zeros_like(done), 'ce')
+            ce_loss = -reward.mean()
+            corrects += correct.float().sum().item()
+            total += B
+        acc = corrects / total
+    
+    if writer is not None:
+        writer.add_scalar('Accuracy/eval_accuracy', acc, num_epoch)
+    print(f"Epoch {num_epoch}, Eval_Accuracy: {acc:.4f}")
+    return acc
+
+
 
 def soft_target_update(net, target_net, tau=0.005):
     for param, target_param in zip(net.parameters(), target_net.parameters()):
@@ -281,18 +318,20 @@ def soft_target_update(net, target_net, tau=0.005):
 func_dict = {
     'q_learning': train_q_learning_iterative,
     'policy_gradient': train_policy_gradient_iterative,
+    # 'ppo': train_ppo_iterative,
     'supervision': train_supervised_iterative,
 }
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('--algorithm', choices=['q_learning', 'policy_gradient', 'supervision'], default='q_learning')
+    parser.add_argument('--algorithm', choices=['q_learning', 'policy_gradient', 'supervision', 'ppo'], default='q_learning')
     parser.add_argument('--reward_type', choices=['acc', 'ce'], default='acc')
     parser.add_argument('--batch_size', type=int, default=1024)
-    parser.add_argument('--max_epochs', type=int, default=100)
+    parser.add_argument('--max_epochs', type=int, default=10000)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--lr2', type=float, default=1e-3)
+    parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--eps', type=float, default=0.9)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--tau', type=float, default=0.005)
@@ -304,6 +343,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.model_dir = os.path.join(args.model_dir, args.exp)
     args.log_dir = os.path.join(args.log_dir, args.exp)
+
+    # set seed
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
     os.makedirs(args.model_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
@@ -330,7 +375,7 @@ if __name__ == '__main__':
     env_opt = torch.optim.Adam(env.parameters(), lr=args.lr2)
     train_function = func_dict[args.algorithm]
     for i in range(args.max_epochs):
-        train_function(actor, act_opt, env_opt, train_loader, env, args.gamma, writer=writer, reward_type=args.reward_type, TAU=args.tau, eps=args.eps, n_epoch=i)
+        train_function(actor, act_opt, env_opt, train_loader, env, args.gamma, writer=writer, reward_type=args.reward_type, TAU=args.tau, eps=args.eps, n_epoch=i, temperature=args.temperature)
         torch.save(actor.state_dict(), os.path.join(args.model_dir, f'actor_{i}.pt'))
         torch.save(env.state_dict(), os.path.join(args.model_dir, f'env_{i}.pt'))
         evaluate(actor, env, val_loader, args.reward_type, i, writer=SummaryWriter(args.log_dir))
